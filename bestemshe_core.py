@@ -12,6 +12,7 @@ from collections import OrderedDict
 from math import comb as _comb
 import numpy as np
 import zstandard as zstd
+from tqdm import tqdm
 
 N_PITS = 10      # 10 лунок (5 своих + 5 соперника)
 STONES = 50      # инвариант: sum(pits) + K1 + K2 == 50
@@ -106,7 +107,8 @@ def _parse_container(data, expected):
         return None
     dctx = zstd.ZstdDecompressor()
     out = bytearray()
-    for b in range(num_blocks):
+    for b in tqdm(range(num_blocks), desc="распаковка слоя", unit="блок",
+                  leave=False, disable=num_blocks < 8):
         out += dctx.decompress(data[offsets[b]:offsets[b + 1]],
                                max_output_size=BLOCK_BYTES)
     return bytes(out[:expected])
@@ -223,7 +225,7 @@ def verify_consistency(tb, n=1000, seed=0):
         return False
     rng = np.random.default_rng(seed)
     bad = checked = 0
-    for _ in range(n):
+    for _ in tqdm(range(n), desc="consistency", unit="поз"):
         pos = sample_position(rng)
         moves = legal_moves(pos)
         if not moves:

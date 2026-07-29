@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 
 class ResBlock(nn.Module):
@@ -104,6 +105,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
 
     step, t_ckpt = 0, time.time()
+    pbar = tqdm(total=a.steps, desc="обучение", unit="шаг")
     while step < a.steps:
         for pits, kaz, wdl, mask in dl:
             pits = pits.cuda(non_blocking=True)
@@ -120,13 +122,16 @@ def main():
             loss.backward()
             opt.step()
             step += 1
+            pbar.update(1)
             if step % 200 == 0:
                 acc = (v.argmax(1) == wdl).float().mean().item()
-                print(f"step {step}  loss {loss.item():.4f}  wdl_acc {acc:.4f}")
+                pbar.set_postfix(loss=f"{loss.item():.4f}",
+                                 wdl_acc=f"{acc:.4f}")
             if time.time() - t_ckpt > a.ckpt_min * 60 or step == a.steps:
                 path = os.path.join(a.ckpt, f"model_{step}.pt")
                 torch.save({"step": step, "model": model.state_dict(),
                             "args": vars(a)}, path)
+                tqdm.write(f"checkpoint: {path}")
                 if a.hub_repo:              # резервная копия на HF Hub
                     from huggingface_hub import upload_file
                     upload_file(path_or_fileobj=path, path_in_repo="latest.pt",
@@ -134,10 +139,11 @@ def main():
                 t_ckpt = time.time()
             if step >= a.steps:
                 break
+    pbar.close()
 
     model.eval(); hit = tot = 0          # финальная валидация
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        for pits, kaz, wdl, mask in vl:
+        for pits, kaz, wdl, mask in tqdm(vl, desc="валидация", unit="батч"):
             v, _ = model(pits.cuda(), kaz.cuda())
             hit += (v.argmax(1).cpu() == wdl).sum().item(); tot += len(wdl)
     print(f"VAL wdl_acc = {hit / tot:.5f}   (цель >= 0.999)")

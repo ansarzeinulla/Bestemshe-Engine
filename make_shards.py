@@ -16,6 +16,7 @@
 import argparse, os
 import numpy as np
 from multiprocessing import Pool
+from tqdm import tqdm
 from bestemshe_core import (Tablebase, KAZANS, sample_position, layer_weights,
                             count_states, rank, unrank, legal_moves, apply_move,
                             verify_consistency, STONES)
@@ -55,7 +56,8 @@ def selftest():
     for R in range(2, 6):                # полный перебор: биекция + round-trip
         n = count_states(R)
         seen = set()
-        for cfg in _compositions(R, 10):
+        for cfg in tqdm(_compositions(R, 10), total=n,
+                        desc=f"selftest R={R}", unit="сост", leave=False):
             r = rank(cfg)
             assert 0 <= r < n and r not in seen, f"rank не биекция на R={R}: {cfg} -> {r}"
             seen.add(r)
@@ -66,7 +68,7 @@ def selftest():
         print(f"selftest R={R}: {n} состояний, биекция и round-trip ok")
 
     rng = np.random.default_rng(0)       # случайные round-trip на полном диапазоне
-    for _ in range(2000):
+    for _ in tqdm(range(2000), desc="round-trip", unit="поз", leave=False):
         R = int(rng.integers(0, 51))
         i = int(rng.integers(count_states(R)))
         assert rank(tuple(unrank(i, R))) == i, f"round-trip провален: R={R}, idx={i}"
@@ -121,13 +123,16 @@ def main():
     per_worker = a.shard_size // a.workers
     n_shards = a.n // a.shard_size
     with Pool(a.workers) as pool:
-        for s in range(n_shards):
+        for s in tqdm(range(n_shards), desc="шарды", unit="шард"):
             jobs = [(s * a.workers + w, per_worker, a.tb)
                     for w in range(a.workers)]
-            shard = np.concatenate(pool.map(_worker, jobs))
+            # imap сохраняет порядок jobs; бар — по завершённым воркерам шарда
+            shard = np.concatenate(list(tqdm(
+                pool.imap(_worker, jobs), total=len(jobs),
+                desc=f"shard {s:04d}", unit="воркер", leave=False)))
             shard.tofile(os.path.join(a.out, f"shard_{s:04d}.bin"))
-            print(f"shard {s + 1}/{n_shards} готов"
-                  f" ({(s + 1) * a.shard_size:,} позиций)")
+            tqdm.write(f"shard {s + 1}/{n_shards} готов"
+                       f" ({(s + 1) * a.shard_size:,} позиций)")
 
 
 if __name__ == "__main__":

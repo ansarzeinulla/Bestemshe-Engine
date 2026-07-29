@@ -6,6 +6,7 @@
 import argparse
 import numpy as np
 import torch
+from tqdm import tqdm
 from bestemshe_core import (Tablebase, sample_position, legal_moves,
                             apply_move, is_terminal_loss)
 from make_shards import optimal_move_mask
@@ -57,7 +58,8 @@ def main():
 
     # 1) точность WDL и доля оптимальных ходов на случайных позициях
     v_hit = m_hit = m_tot = 0
-    for _ in range(a.n):
+    pbar = tqdm(range(1, a.n + 1), desc="позиции", unit="поз")
+    for i in pbar:
         pos = sample_position(rng)
         v_pred, pol = predict(model, pos)
         v_hit += (v_pred == tb.value(pos))
@@ -65,13 +67,17 @@ def main():
         if mask:
             m_tot += 1
             m_hit += bool((mask >> int(np.argmax(pol))) & 1)
+        if i % 1000 == 0:
+            pbar.set_postfix(wdl_acc=f"{v_hit / i:.5f}",
+                             opt_rate=f"{m_hit / max(1, m_tot):.5f}")
     print(f"wdl_acc = {v_hit / a.n:.5f}          (цель >= 0.999)")
     print(f"optimal_move_rate = {m_hit / m_tot:.5f} (цель >= 0.995)")
 
     # 2) партии движка против оракула: инцидент = неоптимальный ход
     #    в позиции, где движку теоретически положена победа или ничья
     incidents = 0
-    for g in range(a.games):
+    gbar = tqdm(range(a.games), desc="партии", unit="партия")
+    for g in gbar:
         pos = (0, 0, [5] * 10)              # стартовая позиция: по 5 камней
         for ply in range(400):
             moves = legal_moves(pos)
@@ -85,6 +91,7 @@ def main():
             else:                           # оракул всегда ходит оптимально
                 m = int(mask).bit_length() - 1
             pos = apply_move(pos, m)
+        gbar.set_postfix(incidents=incidents)
     print(f"incidents = {incidents}          (цель: строго 0)")
 
 
