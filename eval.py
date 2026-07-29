@@ -6,7 +6,8 @@
 import argparse
 import numpy as np
 import torch
-from bestemshe_core import Tablebase, sample_position, legal_moves, apply_move
+from bestemshe_core import (Tablebase, sample_position, legal_moves,
+                            apply_move, is_terminal_loss)
 from make_shards import optimal_move_mask
 from train import BestemsheNet
 
@@ -29,10 +30,16 @@ def predict(model, pos):
 
 
 def engine_move(model, pos):
-    """Боевой движок: выбор хода по value детей (1 полуход) — БЕЗ tablebase."""
+    """Боевой движок: выбор хода по value детей (1 полуход) — БЕЗ tablebase.
+    Терминальный шорткат как в query.cpp: ход, опустошающий соперника или
+    доводящий казан до >= 26, — немедленная победа по правилам, модель не
+    вызывается (казан ребёнка может быть >= 26 — вне домена Embedding(13))."""
     best, best_v = None, -1
     for m in legal_moves(pos):
-        child_v, _ = predict(model, apply_move(pos, m))
+        child = apply_move(pos, m)
+        if is_terminal_loss(child):         # соперник проиграл — ходим сразу
+            return m
+        child_v, _ = predict(model, child)
         if 2 - child_v > best_v:            # инверсия WDL после смены стороны
             best, best_v = m, 2 - child_v
     return best

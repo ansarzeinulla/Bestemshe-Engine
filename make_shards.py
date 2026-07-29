@@ -5,6 +5,8 @@
   [12]   WDL (0=loss, 1=draw, 2=win)
   [13]   битовая маска оптимальных ходов (биты 0..4)
 
+Проверка порта rank/unrank БЕЗ tablebase (бесплатно, локально):
+  python make_shards.py --selftest
 Самопроверка ДО генерации (обязательна, см. раздел 4.4):
   python make_shards.py --tb /workspace/tablebase --verify 2000
 Полный запуск:
@@ -15,7 +17,7 @@ import argparse, os
 import numpy as np
 from multiprocessing import Pool
 from bestemshe_core import (Tablebase, KAZANS, sample_position, layer_weights,
-                            count_states, unrank, legal_moves, apply_move,
+                            count_states, rank, unrank, legal_moves, apply_move,
                             verify_consistency, STONES)
 
 BLOCK = 50_000   # позиций одного слоя подряд — бережём кэш распакованных слоёв
@@ -29,6 +31,47 @@ def optimal_move_mask(tb, pos):
     child = {m: tb.value(apply_move(pos, m)) for m in moves}
     best = max(2 - v for v in child.values())
     return sum(1 << m for m, v in child.items() if 2 - v == best)
+
+
+def _compositions(total, parts):
+    """Все раскладки total камней по parts лункам (для полного перебора)."""
+    if parts == 1:
+        yield (total,)
+        return
+    for v in range(total + 1):
+        for rest in _compositions(total - v, parts - 1):
+            yield (v,) + rest
+
+
+def selftest():
+    """Проверка соответствия rank/unrank индексации решателя (StateIndex.h /
+    Solver.h::IndexBoard) без tablebase. Якорные значения посчитаны C++ кодом.
+    ВАЖНО: при R=1 колекс- и лекс-порядки совпадают, поэтому тестируем R>=2."""
+    # Якорь из C++ IndexBoard: доска (0,2,0,...,0) -> индекс 52 (лекс-rank дал бы 44)
+    anchor = (0, 2, 0, 0, 0, 0, 0, 0, 0, 0)
+    assert rank(anchor) == 52, f"rank{anchor} = {rank(anchor)}, ожидается 52 (C++ IndexBoard)"
+    assert unrank(52, 2) == list(anchor), f"unrank(52, 2) = {unrank(52, 2)}, ожидается {list(anchor)}"
+
+    for R in range(2, 6):                # полный перебор: биекция + round-trip
+        n = count_states(R)
+        seen = set()
+        for cfg in _compositions(R, 10):
+            r = rank(cfg)
+            assert 0 <= r < n and r not in seen, f"rank не биекция на R={R}: {cfg} -> {r}"
+            seen.add(r)
+            assert unrank(r, R) == list(cfg), f"round-trip провален: {cfg} -> {r} -> {unrank(r, R)}"
+        assert len(seen) == n
+        # unrank(0) = (0,...,0,R): согласовано с wrap в Solver.cpp (AdvanceBoard)
+        assert unrank(0, R) == [0] * 9 + [R]
+        print(f"selftest R={R}: {n} состояний, биекция и round-trip ok")
+
+    rng = np.random.default_rng(0)       # случайные round-trip на полном диапазоне
+    for _ in range(2000):
+        R = int(rng.integers(0, 51))
+        i = int(rng.integers(count_states(R)))
+        assert rank(tuple(unrank(i, R))) == i, f"round-trip провален: R={R}, idx={i}"
+    print("selftest: 2000 случайных round-trip (R до 50) ok")
+    print("selftest: OK — rank/unrank совпадают с индексацией решателя")
 
 
 def _worker(args):
@@ -53,13 +96,21 @@ def _worker(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tb", required=True)
+    ap.add_argument("--tb")              # обязателен для всего, кроме --selftest
     ap.add_argument("--out", default="/workspace/shards")
     ap.add_argument("--n", type=int, default=500_000_000)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--shard-size", type=int, default=20_000_000)
     ap.add_argument("--verify", type=int, default=0)
+    ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
+
+    if a.selftest:                       # проверка rank/unrank без tablebase
+        selftest()
+        raise SystemExit(0)
+
+    if not a.tb:
+        ap.error("--tb обязателен (кроме режима --selftest)")
 
     if a.verify:                         # режим самопроверки — без генерации
         ok = verify_consistency(Tablebase(a.tb), n=a.verify)
