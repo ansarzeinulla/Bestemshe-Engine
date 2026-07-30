@@ -5,8 +5,20 @@
       --batch 32768 --lr 3e-4 --steps 60000 --width 1024 --blocks 8 \
       --hub-repo <ваш_ник>/bestemshe-engine
 60 000 шагов x 32 768 = ~2 млрд просмотренных примеров (~3-4 эпохи по 500 млн).
+
+ИЗМЕНЕНИЯ (continuous learning):
+  --resume <ckpt.pt>    — грузит веса модели, состояние оптимизатора AdamW
+                          и номер шага, чтобы дообучение продолжалось, а не
+                          начиналось заново (чекпоинт теперь хранит "optimizer").
+  --consume-shards      — по завершении одного полного прохода по данным
+                          (эпохи) физически удаляет .bin файлы шардов из
+                          --data, освобождая место под новую генерацию.
+                          Удаление один раз (после первой законченной эпохи).
+  --hub-repo/--hub-token — при каждом чекпоинте на HF Hub теперь льётся не
+                          только latest.pt, но и training_stats.json
+                          (step, loss, wdl_acc, lr) для мониторинга на сайте.
 """
-import argparse, glob, math, os, time
+import argparse, glob, json, math, os, time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -50,9 +62,9 @@ class ShardData(Dataset):
     """14-байтовые записи make_shards.py через np.memmap — без загрузки в RAM."""
 
     def __init__(self, folder):
-        files = sorted(glob.glob(os.path.join(folder, "shard_*.bin")))
-        assert files, f"нет шардов в {folder}"
-        self.mm = [np.memmap(f, dtype=np.uint8).reshape(-1, 14) for f in files]
+        self.files = sorted(glob.glob(os.path.join(folder, "shard_*.bin")))
+        assert self.files, f"нет шардов в {folder}"
+        self.mm = [np.memmap(f, dtype=np.uint8).reshape(-1, 14) for f in self.files]
         self.cum = np.cumsum([m.shape[0] for m in self.mm])
 
     def __len__(self):
@@ -76,6 +88,26 @@ def lr_at(step, base, warmup, total):
     return base * 0.5 * (1 + math.cos(math.pi * t))
 
 
+def _delete_shards(paths):
+    """Физически убирает .bin шарды с диска (место освобождается под новую
+    генерацию). Уже открытые np.memmap продолжают работать после unlink —
+    так ведёт себя POSIX, пока страницы держатся в памяти воркеров."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            continue
+    tqdm.write(f"consume-shards: удалено {len(paths)} файлов из {os.path.dirname(paths[0]) if paths else '?'}")
+
+
+def _push_to_hub(repo, token, ckpt_path, stats_path):
+    from huggingface_hub import upload_file
+    upload_file(path_or_fileobj=ckpt_path, path_in_repo="latest.pt",
+                repo_id=repo, token=token or None)
+    upload_file(path_or_fileobj=stats_path, path_in_repo="training_stats.json",
+                repo_id=repo, token=token or None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
@@ -90,6 +122,10 @@ def main():
     ap.add_argument("--val-frac", type=float, default=0.002)
     ap.add_argument("--ckpt-min", type=int, default=30)
     ap.add_argument("--hub-repo", default="")
+    ap.add_argument("--hub-token", default="")
+    ap.add_argument("--resume", default="", help="путь к чекпоинту для дообучения")
+    ap.add_argument("--consume-shards", action="store_true",
+                    help="удалить .bin шарды из --data после первой законченной эпохи")
     a = ap.parse_args()
     os.makedirs(a.ckpt, exist_ok=True)
 
@@ -104,8 +140,19 @@ def main():
     model = torch.compile(BestemsheNet(a.width, a.blocks).cuda())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
 
-    step, t_ckpt = 0, time.time()
-    pbar = tqdm(total=a.steps, desc="обучение", unit="шаг")
+    step = 0
+    if a.resume:
+        ck = torch.load(a.resume, map_location="cuda")
+        model.load_state_dict(ck["model"])
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+        step = ck.get("step", 0)
+        tqdm.write(f"resume: {a.resume} -> шаг {step}")
+
+    shards_consumed = False
+    t_ckpt = time.time()
+    pbar = tqdm(total=a.steps, initial=step, desc="обучение", unit="шаг")
+    acc = 0.0
     while step < a.steps:
         for pits, kaz, wdl, mask in dl:
             pits = pits.cuda(non_blocking=True)
@@ -130,15 +177,32 @@ def main():
             if time.time() - t_ckpt > a.ckpt_min * 60 or step == a.steps:
                 path = os.path.join(a.ckpt, f"model_{step}.pt")
                 torch.save({"step": step, "model": model.state_dict(),
-                            "args": vars(a)}, path)
+                            "optimizer": opt.state_dict(), "args": vars(a)}, path)
                 tqdm.write(f"checkpoint: {path}")
-                if a.hub_repo:              # резервная копия на HF Hub
-                    from huggingface_hub import upload_file
-                    upload_file(path_or_fileobj=path, path_in_repo="latest.pt",
-                                repo_id=a.hub_repo)
+                if a.hub_repo:              # резервная копия + метрики на HF Hub
+                    stats_path = os.path.join(a.ckpt, "training_stats.json")
+                    with open(stats_path, "w") as f:
+                        json.dump({
+                            "step": step,
+                            "loss": loss.item(),
+                            "wdl_acc": acc,
+                            "lr": g["lr"],
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        }, f, indent=2)
+                    _push_to_hub(a.hub_repo, a.hub_token, path, stats_path)
                 t_ckpt = time.time()
             if step >= a.steps:
                 break
+        else:
+            # for-loop дошёл до конца без break -> закончился полный проход по данным
+            if a.consume_shards and not shards_consumed:
+                _delete_shards(ds.files)
+                shards_consumed = True
+            continue
+        if a.consume_shards and not shards_consumed:
+            _delete_shards(ds.files)
+            shards_consumed = True
+        break
     pbar.close()
 
     model.eval(); hit = tot = 0          # финальная валидация
@@ -146,7 +210,32 @@ def main():
         for pits, kaz, wdl, mask in tqdm(vl, desc="валидация", unit="батч"):
             v, _ = model(pits.cuda(), kaz.cuda())
             hit += (v.argmax(1).cpu() == wdl).sum().item(); tot += len(wdl)
-    print(f"VAL wdl_acc = {hit / tot:.5f}   (цель >= 0.999)")
+    if tot:
+        val_acc = hit / tot
+        print(f"VAL wdl_acc = {val_acc:.5f}   (цель >= 0.999)")
+    else:
+        val_acc = None   # val-split пуст (слишком маленький --data при таком --val-frac)
+        print("VAL: пропущено — val-split пуст (0 записей)")
+
+    # ФИНАЛЬНЫЙ пуш на HF Hub — безусловно, а не только по таймеру ckpt-min,
+    # чтобы по завершении обучения на Hub гарантированно лежала последняя модель.
+    final_path = os.path.join(a.ckpt, f"model_{step}.pt")
+    torch.save({"step": step, "model": model.state_dict(),
+                "optimizer": opt.state_dict(), "args": vars(a)}, final_path)
+    if a.hub_repo:
+        stats_path = os.path.join(a.ckpt, "training_stats.json")
+        with open(stats_path, "w") as f:
+            json.dump({
+                "step": step,
+                "loss": loss.item(),
+                "wdl_acc": acc,
+                "val_wdl_acc": val_acc,
+                "lr": a.lr,
+                "final": True,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }, f, indent=2)
+        _push_to_hub(a.hub_repo, a.hub_token, final_path, stats_path)
+        print(f"финальный чекпоинт (step={step}) залит на HF Hub: {a.hub_repo}")
 
 
 if __name__ == "__main__":
