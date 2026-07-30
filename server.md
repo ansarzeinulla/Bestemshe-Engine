@@ -98,16 +98,42 @@ python eval.py --tb "$TB" --model /ckpt/model_26.pt --n 100 --games 20 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
+> **С шага 4 — два изменения, БЕЗ правки файлов репозитория:**
+> 1. `train.py --workers 24` — больше процессов DataLoader'а подвозят батчи с диска.
+> 2. `eval.py` теперь запускается через обёртку `eval_boosted.py` ниже — она НЕ меняет
+>    `eval.py`/`bestemshe_core.py`, а перед запуском на лету поднимает размер LRU-кэша
+>    распакованных слоёв tablebase (`Tablebase.__init__` default `max_layers`) с 8 до 48.
+>    Это ускоряет именно `eval.py` (один живой `Tablebase` на весь прогон, кэш реально
+>    накапливается). На `make_shards.py` это НЕ влияет: там каждый воркер создаёт свежий
+>    `Tablebase` на каждую джобу, кэш там в любом случае стартует пустым — размер кэша
+>    тут не поможет, причина скорости там другая.
+> 48 слоёв в кэше — до ~48×1.6 ГБ ≈ 77 ГБ худший случай, у вас 129 ГБ RAM, запас есть.
+
+Создайте один раз (это НЕ правка `eval.py`, а отдельный маленький лаунчер рядом,
+который просто дергает существующий `eval.py` с подменённым дефолтом кэша):
+
+```bash
+cat > eval_boosted.py <<'PY'
+import bestemshe_core
+bestemshe_core.Tablebase.__init__.__defaults__ = (48,)  # было 8
+import runpy
+runpy.run_path("eval.py", run_name="__main__")
+PY
+```
+
+Дальше везде вместо `python eval.py ...` используем `python eval_boosted.py ...`
+(флаги те же самые).
+
 ### Ступень 4 — `n=1_000` (`--steps 76` = 26+50)
 
 ```bash
 python make_shards.py --tb "$TB" --out /shards --n 1_000 --shard-size 1_000 --workers 8 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_26.pt --batch 128 --steps 76 --val-frac 0.05 --consume-shards \
+    --resume /ckpt/model_26.pt --batch 128 --steps 76 --val-frac 0.05 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_76.pt --n 1_000 --games 100 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_76.pt --n 1_000 --games 100 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -117,10 +143,10 @@ python eval.py --tb "$TB" --model /ckpt/model_76.pt --n 1_000 --games 100 \
 python make_shards.py --tb "$TB" --out /shards --n 10_000 --shard-size 10_000 --workers 16 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_76.pt --batch 1024 --steps 176 --val-frac 0.02 --consume-shards \
+    --resume /ckpt/model_76.pt --batch 1024 --steps 176 --val-frac 0.02 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_176.pt --n 10_000 --games 500 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_176.pt --n 10_000 --games 500 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -130,10 +156,10 @@ python eval.py --tb "$TB" --model /ckpt/model_176.pt --n 10_000 --games 500 \
 python make_shards.py --tb "$TB" --out /shards --n 100_000 --shard-size 100_000 --workers 24 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_176.pt --batch 4096 --steps 476 --val-frac 0.01 --consume-shards \
+    --resume /ckpt/model_176.pt --batch 4096 --steps 476 --val-frac 0.01 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_476.pt --n 50_000 --games 1000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_476.pt --n 50_000 --games 1000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -143,10 +169,10 @@ python eval.py --tb "$TB" --model /ckpt/model_476.pt --n 50_000 --games 1000 \
 python make_shards.py --tb "$TB" --out /shards --n 300_000 --shard-size 300_000 --workers 24 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_476.pt --batch 8192 --steps 976 --val-frac 0.01 --consume-shards \
+    --resume /ckpt/model_476.pt --batch 8192 --steps 976 --val-frac 0.01 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_976.pt --n 100_000 --games 2000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_976.pt --n 100_000 --games 2000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -156,10 +182,10 @@ python eval.py --tb "$TB" --model /ckpt/model_976.pt --n 100_000 --games 2000 \
 python make_shards.py --tb "$TB" --out /shards --n 1_000_000 --shard-size 1_000_000 --workers 32 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_976.pt --batch 16384 --steps 1976 --val-frac 0.005 --consume-shards \
+    --resume /ckpt/model_976.pt --batch 16384 --steps 1976 --val-frac 0.005 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_1976.pt --n 200_000 --games 3000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_1976.pt --n 200_000 --games 3000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -169,10 +195,10 @@ python eval.py --tb "$TB" --model /ckpt/model_1976.pt --n 200_000 --games 3000 \
 python make_shards.py --tb "$TB" --out /shards --n 3_000_000 --shard-size 1_500_000 --workers 32 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_1976.pt --batch 16384 --steps 3976 --val-frac 0.005 --consume-shards \
+    --resume /ckpt/model_1976.pt --batch 16384 --steps 3976 --val-frac 0.005 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_3976.pt --n 300_000 --games 5000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_3976.pt --n 300_000 --games 5000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -182,10 +208,10 @@ python eval.py --tb "$TB" --model /ckpt/model_3976.pt --n 300_000 --games 5000 \
 python make_shards.py --tb "$TB" --out /shards --n 10_000_000 --shard-size 2_000_000 --workers 32 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_3976.pt --batch 32768 --steps 8976 --val-frac 0.002 --consume-shards \
+    --resume /ckpt/model_3976.pt --batch 32768 --steps 8976 --val-frac 0.002 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_8976.pt --n 500_000 --games 8000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_8976.pt --n 500_000 --games 8000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -195,10 +221,10 @@ python eval.py --tb "$TB" --model /ckpt/model_8976.pt --n 500_000 --games 8000 \
 python make_shards.py --tb "$TB" --out /shards --n 30_000_000 --shard-size 5_000_000 --workers 32 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_8976.pt --batch 32768 --steps 18976 --val-frac 0.002 --consume-shards \
+    --resume /ckpt/model_8976.pt --batch 32768 --steps 18976 --val-frac 0.002 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_18976.pt --n 1_000_000 --games 10000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_18976.pt --n 1_000_000 --games 10000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
@@ -208,10 +234,10 @@ python eval.py --tb "$TB" --model /ckpt/model_18976.pt --n 1_000_000 --games 100
 python make_shards.py --tb "$TB" --out /shards --n 100_000_000 --shard-size 20_000_000 --workers 32 --mode append
 
 python train.py --data /shards --ckpt /ckpt \
-    --resume /ckpt/model_18976.pt --batch 32768 --steps 78976 --val-frac 0.002 --consume-shards \
+    --resume /ckpt/model_18976.pt --batch 32768 --steps 78976 --val-frac 0.002 --workers 24 --consume-shards \
     --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 
-python eval.py --tb "$TB" --model /ckpt/model_78976.pt --n 1_000_000 --games 10000 \
+python eval_boosted.py --tb "$TB" --model /ckpt/model_78976.pt --n 1_000_000 --games 10000 \
     --out-dir /eval --hub-repo "$HUB_REPO" --hub-token "$HF_TOKEN"
 ```
 
