@@ -1,1 +1,7 @@
+__pycache__/*.pt
+eval_results_*.json
+vs_god_results*.json
+*.log
 __pycache__/
+.DS_Store
+web/
